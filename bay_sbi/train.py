@@ -61,6 +61,13 @@ def initialized(
         {'params': rng}, jnp.ones(y_shape),
         jnp.ones(context_shape)
     )
+
+    # Not all models have batch stats.
+    if not 'batch_stats' in variables:
+        variables['batch_stats'] = jax.tree_map(
+            lambda x: None, variables['params']
+        )
+
     return variables['params'], variables['batch_stats']
 
 
@@ -150,7 +157,7 @@ class TrainState(train_state.TrainState):
 
 def create_train_state_nf(
     rng: Sequence[int], optimizer: str,
-    model: Any, image_size: int, parameter_dim: int,
+    model: Any, context_dim: int, parameter_dim: int,
     learning_rate_schedule: Callable[[Union[int, jnp.ndarray]], float],
     image_context: Optional[bool] = False
 ) -> TrainState:
@@ -160,7 +167,7 @@ def create_train_state_nf(
         rng: jax PRNG key.
         optimizer: Optimizer name.
         model: Instance of model architecture.
-        image_size: Dimension of square image.
+        context_dim: Dimension of context.
         learning_rate_schedule: Learning rate schedule.
         image_context: If true the context is assumed to be an image.
 
@@ -168,7 +175,7 @@ def create_train_state_nf(
         Initialized TrainState for model.
     """
     params, batch_stats = initialized(
-        rng, image_size, parameter_dim, model, image_context
+        rng, context_dim, parameter_dim, model, image_context
     )
     tx, opt_mask = get_optimizer(optimizer, learning_rate_schedule, params)
     state = TrainState.create(
@@ -295,7 +302,7 @@ def train_step(
     rng: Sequence[int], state: TrainState, batch: Mapping[str, jnp.ndarray],
     mu_prior: jnp.ndarray, prec_prior: jnp.ndarray,
     learning_rate_schedule: Callable[[Union[int, jnp.ndarray]], float],
-    n_atoms: int, opt_mask: Mapping[str, jnp.ndarray]
+    n_atoms: int
 ) -> Tuple[TrainState, Mapping[str, Any]]:
     """Perform a single training step.
 
@@ -333,14 +340,6 @@ def train_step(
     # Extract gradients for weight updates and current model state / loss.
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)
     (loss, new_model_state), grads = grad_fn(state.params)
-
-    # Re-use same axis_name as in the call to `pmap(...train_step...)` below.
-    def _pmean_if_not_freeze(grad, freeze_grad):
-        # Apply pmean only if it is not a frozen gradient.
-        if freeze_grad:
-            return grad
-        return jax.lax.pmean(grad, axis_name='batch')
-    grads = jax.tree_map(_pmean_if_not_freeze, grads, opt_mask)
 
     metrics = {'learning_rate' : lr, 'loss': loss}
 

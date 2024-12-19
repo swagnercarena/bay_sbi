@@ -34,7 +34,8 @@ from paltax.models import ModuleDef
 
 
 def _made_degrees(
-    input_size: int, hidden_dims: Union[List[int], None]
+    input_size: int, hidden_dims: Union[List[int], None],
+    n_context: Optional[int] = 0
 ) -> List[jnp.ndarray]:
     """Return degrees to build masks for MADE fully connected networks.
 
@@ -42,6 +43,8 @@ def _made_degrees(
         input_size: Number of inputs to the fully connected network.
         hidden_dims: Hidden layer dimensions of the fully connected network. If
             None no hidden layers.
+        n_context: The number of inputs that are context. Context inputs will
+            set the minimum degree for hidden units.
 
     Returns:
         Degree for each input and node in the hidden layers.
@@ -58,12 +61,16 @@ def _made_degrees(
     if hidden_dims is None:
         hidden_dims = []
 
+    # For the hidden units, the minimum degree is either 1 when there is no
+    # context, or the number of context inputs.
+    min_degree = max(1, n_context)
+
     for dimension in hidden_dims:
         degrees.append(
             jnp.ceil(
-                jnp.arange(1, dimension + 1) * (input_size - 1.0) /
-                (dimension + 1.0)
-            ).astype(int)
+                jnp.arange(0, dimension, dtype=int) %
+                (input_size - min_degree)
+            ) + (min_degree)
         )
 
     return degrees
@@ -112,7 +119,7 @@ def _made_dense_autoregressive_masks(
         hidden_dims: Hidden layer dimensions of the fully connected network. If
             None no hidden layers.
     """
-    degrees = _made_degrees(n_total_cond, hidden_dims)
+    degrees = _made_degrees(n_total_cond, hidden_dims, n_context)
     masks = _made_masks(degrees, n_context)
 
     # Final mask needs to be tiled to account for more than one output per
@@ -177,9 +184,12 @@ class MADE(nn.Module):
     Args:
         hidden_dims: Hidden dimensions of the fully connected network.
         activation: Activation function of the fully connected network.
+        use_context: Boolean that controls whether or not the context will be
+            when it is provided.
     """
     hidden_dims: Union[List[int], None]
     activation: Optional[str] = 'tanh'
+    use_context: Optional[bool] = True
 
     @compact
     def __call__(
@@ -197,7 +207,7 @@ class MADE(nn.Module):
         cond_dim = 0
 
         # Append context if it is provided.
-        if context is not None:
+        if context is not None and self.use_context:
             # Stack context on left to ensure that all outputs are conditioned
             # on context.
             x = jnp.hstack([context, x])
@@ -319,13 +329,28 @@ class _MAFLayer(_ConidtionalBijector):
     Args:
         made_layer: Instance of MADE that will be used as foundation of MAF
             layer.
+        log_scale_max: The maximum magnitude of the scale in log space. Will be
+            imposed with a softmax function, and defualts to 10.0.
     """
 
-    def __init__(self, made_layer: nn.Module):
+    def __init__(
+        self, made_layer: nn.Module, log_scale_max: Optional[float] = 10.0
+    ):
         super().__init__(event_ndims_in=1)
         # For the flax modle to play nice, the made_layer has to be initialized
         # within another module (i.e. not inside a distrx.Bijector).
         self.made_layer = made_layer
+        self.log_scale_max = log_scale_max
+
+    def _transform_log_scale(self, log_scale: float):
+        """Transform the log scale to respect the maximum magnitude.
+        Args:
+            log_scale: Input log scale.
+
+        Returns:
+            Transformed log scale.
+        """
+        return log_scale / (1 + jnp.abs(log_scale / self.log_scale_max))
 
     def forward_and_log_det(
         self, x: jnp.ndarray, context: Union[jnp.ndarray, None]
@@ -357,7 +382,7 @@ class _MAFLayer(_ConidtionalBijector):
             y, log_det = (
                 distrax.ScalarAffine(
                     shift=gaussian_params[..., 0],
-                    log_scale=gaussian_params[..., 1]
+                    log_scale=self._transform_log_scale(gaussian_params[..., 1])
                 ).forward_and_log_det(x)
             )
 
@@ -377,7 +402,8 @@ class _MAFLayer(_ConidtionalBijector):
         """
         gaussian_params = self.made_layer(y, context)
         x, log_det = distrax.ScalarAffine(
-            shift=gaussian_params[..., 0], log_scale=gaussian_params[..., 1]
+            shift=gaussian_params[..., 0],
+            log_scale=self._transform_log_scale(gaussian_params[..., 1])
         ).inverse_and_log_det(y)
 
         return x, jnp.sum(log_det, axis=-1)
@@ -628,9 +654,9 @@ class MAF(nn.Module):
         # Create a list of bijectors. For each transformation, we want to first
         # permute the dimensions and then apply a MAF layer.
         self.made_layers = [
-            MADE(self.hidden_dims, self.activation) for _ in range(
-                self.n_maf_layers
-            )
+            MADE(
+                self.hidden_dims, self.activation,
+            ) for i in range(self.n_maf_layers)
         ]
         self.permute_layers = [
             _PermuteLayer() for _ in range(self.n_maf_layers)
@@ -719,7 +745,8 @@ class EmbeddedFlow(nn.Module):
     flow_module: ModuleDef
 
     def __call__(
-        self, y: jnp.ndarray, unembedded_context: jnp.ndarray
+        self, y: jnp.ndarray, unembedded_context: jnp.ndarray,
+        train: Optional[bool] = True
     ) -> jnp.ndarray:
         """Return log probability of transformed random variables.
 
@@ -727,15 +754,18 @@ class EmbeddedFlow(nn.Module):
             y: Transformed random variables.
             unembedded_context: Context for flow transformation before
                 embedding. This should be the raw data.
+            train: Whether or not the model is being trained and batch
+                statistics should be updated.
 
         Returns:
             Log probability of transformed random variables.
         """
-        context = self.embed_context(unembedded_context)
+        context = self.embed_context(unembedded_context, train)
         return self.flow_module(y, context)
 
     def call_apt(
-        self, y_apt: jnp.ndarray, unembedded_context: jnp.ndarray
+        self, y_apt: jnp.ndarray, unembedded_context: jnp.ndarray,
+        train: Optional[bool] = True
     ) -> jnp.ndarray:
         """Return log probability of transformed random variables.
 
@@ -745,30 +775,36 @@ class EmbeddedFlow(nn.Module):
                 unembedded_context).
             unembedded_context: Context for flow transformation before
                 embedding. This should be the raw data.
+            train: Whether or not the model is being trained and batch
+                statistics should be updated.
 
         Returns:
             Log probability of transformed random variables.
         """
-        context = self.embed_context(unembedded_context)
+        context = self.embed_context(unembedded_context, train)
         return jax.vmap(self.flow_module, in_axes=[1, None], out_axes=1)(
             y_apt, context
         )
 
-    def embed_context(self, unembedded_context: jnp.ndarray) -> jnp.ndarray:
+    def embed_context(
+        self, unembedded_context: jnp.ndarray, train: bool
+    ) -> jnp.ndarray:
         """Embed context using embedding network.
 
         Args:
             unembedded_context: Context for flow transformation before
                 embedding. This should be the raw data.
+            train: Whether or not the model is being trained and batch
+                statistics should be updated.
 
         Returns:
             Context after embedding.
         """
-        return self.embedding_module(unembedded_context)
+        return self.embedding_module(unembedded_context, train)
 
     def sample(
         self, rng: List[int], unembedded_context: jnp.ndarray,
-        sample_shape: List[int]
+        sample_shape: List[int], train: Optional[bool] = True
     ) -> jnp.ndarray:
         """Draw samples from transformed distribution.
 
@@ -777,6 +813,8 @@ class EmbeddedFlow(nn.Module):
             unembedded_context: Context for flow transformation before
                 embedding. This should be the raw data.
             sample_shape: Desired output shape of samples.
+            train: Whether or not the model is being trained and batch
+                statistics should be updated.
 
         Returns:
             Samples of transformed variables.
@@ -786,7 +824,7 @@ class EmbeddedFlow(nn.Module):
             in it (i.e. batch norm). Passing in only one point of context may
             may lead to unexpected behavior.
         """
-        context = self.embed_context(unembedded_context)
+        context = self.embed_context(unembedded_context, train)
         rng_sample = jax.random.split(rng, len(context))
         return jax.vmap(self.flow_module.sample, in_axes=[0, 0, None])(
             rng_sample, context, sample_shape
@@ -794,7 +832,7 @@ class EmbeddedFlow(nn.Module):
 
     def sample_and_log_prob(
         self, rng: List[int], unembedded_context: jnp.ndarray,
-        sample_shape: List[int]
+        sample_shape: List[int], train: Optional[bool] = True
     ) -> jnp.ndarray:
         """Draw samples and corresponding log probability of the sample.
 
@@ -803,6 +841,8 @@ class EmbeddedFlow(nn.Module):
             unembedded_context: Context for flow transformation before
                 embedding. This should be the raw data.
             sample_shape: Desired output shape of samples.
+            train: Whether or not the model is being trained and batch
+                statistics should be updated.
 
         Returns:
             Samples of transformed variables and log probability.
@@ -812,7 +852,7 @@ class EmbeddedFlow(nn.Module):
             in it (i.e. batch norm). Passing in only one point of context may
             may lead to unexpected behavior.
         """
-        context = self.embed_context(unembedded_context)
+        context = self.embed_context(unembedded_context, train)
         rng_sample = jax.random.split(rng, len(context))
         return jax.vmap(
             self.flow_module.sample_and_log_prob, in_axes=[0, 0, None]

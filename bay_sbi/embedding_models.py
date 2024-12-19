@@ -25,6 +25,15 @@ import jax.numpy as jnp
 ModuleDef = Any
 
 
+class Identity(nn.Module):
+    """Identity"""
+
+    @nn.compact
+    def __call__(self, inputs, train: bool = True):
+
+        return inputs
+
+
 class MLP(nn.Module):
     """MLP"""
     output_dim: int

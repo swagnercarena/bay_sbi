@@ -18,13 +18,15 @@ import jax.numpy as jnp
 import jax
 
 # r_std, r_mean = 0.01, 0.1
+theta_shift = 0.0
 
-def draw_two_moons(rng, theta, r_std=0.01, r_mean = 0.1):
+def draw_two_moons(rng, theta, r_std=0.06, r_mean = 0.3):
     """Draw two moons following APT paper."""
+    theta -= theta_shift
     rng_a, rng_r = jax.random.split(rng)
     a = jax.random.uniform(rng_a, minval=-jnp.pi/2, maxval=jnp.pi/2)
     r = jax.random.normal(rng_r) * r_std + r_mean
-    p = jnp.array([r * jnp.cos(a) + 0.25, r * jnp.sin(a)])
+    p = jnp.array([r * jnp.cos(a) + 0.025, r * jnp.sin(a)])
     return p + jnp.array(
         [
             -jnp.abs(jnp.sum(theta))/jnp.sqrt(2),
@@ -32,11 +34,11 @@ def draw_two_moons(rng, theta, r_std=0.01, r_mean = 0.1):
         ]
     )
 
-def draw_param(rng, x, r_std=0.01, r_mean = 0.1):
+def draw_param(rng, x, r_std=0.06, r_mean = 0.3):
         rng_a, rng_r, rng_q = jax.random.split(rng, 3)
         a = jax.random.uniform(rng_a, minval=-jnp.pi/2, maxval=jnp.pi/2)
         r = jax.random.normal(rng_r) * r_std + r_mean
-        p = jnp.array([r * jnp.cos(a) + 0.25, r * jnp.sin(a)])
+        p = jnp.array([r * jnp.cos(a) + 0.025, r * jnp.sin(a)])
 
         q_zero = p[0] - x[0]
         q_one = x[1] - p[1]
@@ -50,9 +52,9 @@ def draw_param(rng, x, r_std=0.01, r_mean = 0.1):
                 q_zero/jnp.sqrt(2) - q_one/jnp.sqrt(2),
                 q_zero/jnp.sqrt(2) + q_one/jnp.sqrt(2)
             ]
-        )
+        ) + theta_shift
 
-def draw_joint_two_moons(rng, theta_min = -1.0, theta_max = 1.0):
+def draw_joint_two_moons(rng, theta_min = -2.0, theta_max = 2.0):
     """Return theta and x from two moons simulation."""
     rng_theta, rng_x = jax.random.split(rng)
     theta = jax.random.uniform(
